@@ -1,0 +1,28 @@
+# Ignore Visual Studio temporary files
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Ignore build output
+bin/
+obj/
+
+# Ignore NuGet packages
+packages/
+
+# Ignore ReSharper cache
+_ReSharper.*/
+*.[Rr]e[Ss]harper
+
+# Ignore Test Results
+TestResults/
+
+# Ignore local config files
+appsettings.Development.json
+appsettings.Local.json
+
+# Ignore macOS and Linux system files
+.DS_Store
+Thumbs.db
