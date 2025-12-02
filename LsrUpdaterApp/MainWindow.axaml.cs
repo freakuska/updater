@@ -10,6 +10,8 @@ namespace LsrFirmwareUpdater
         public MainWindow()
         {
             InitializeComponent();
+
+            this.DataContext = new MainWindowViewModel();
         }
 
         private void InitializeComponent()

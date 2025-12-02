@@ -8,18 +8,18 @@ using System.Threading.Tasks;
 namespace LsrUpdaterApp.Services
 {
     /// <summary>
-    /// реализация TFTP протокола без внешних зависимостей 
+    /// TFTP-клиент (RFC 1350) - написано с нуля на чистом UDP
+    /// Поддерживает upload и download прошивок
     /// </summary>
-    public class TftpService
+    public class TftpService : IDisposable
     {
         private const int TFTP_PORT = 69;
         private const int BLOCK_SIZE = 512;
-        private const int TIMEOUT_MS = 5000;
+        private const int TIMEOUT = 5000; // 5 сек
         private const int MAX_RETRIES = 3;
 
         private readonly string _serverIp;
-        private UdpClient _udpClient;
-        private bool _disposed = false;
+        private bool _disposed;
 
         public event EventHandler<string> OnProgress;
         public event EventHandler<string> OnError;
@@ -31,11 +31,8 @@ namespace LsrUpdaterApp.Services
         }
 
         /// <summary>
-        /// отправка файла прошивки на устройство через TFTP
+        /// UPLOAD прошивки (PUT файла на сервер)
         /// </summary>
-        /// <param name="localFilePath"></param>
-        /// <param name="remoteFileName"></param>
-        /// <returns></returns>
         public async Task<bool> SendFirmwareAsync(string localFilePath, string remoteFileName)
         {
             if (!File.Exists(localFilePath))
@@ -46,282 +43,228 @@ namespace LsrUpdaterApp.Services
 
             return await Task.Run(() =>
             {
-                try
+                using (var client = new UdpClient())
                 {
-                    var fileInfo = new FileInfo(localFilePath);
-                    long fileLength = fileInfo.Length;
-
-                    OnProgress?.Invoke(this, $"📡 TFTP: Инициализация подключения к {_serverIp}:69");
-                    OnProgress?.Invoke(this, $"📦 TFTP: Отправка файла {remoteFileName} ({fileLength} байт)");
-
-                    using (var fileStream = new FileStream(localFilePath, FileMode.Open, FileAccess.Read))
+                    try
                     {
-                        byte[] buffer = new byte[BLOCK_SIZE];
-                        int bytesRead;
-                        ushort blockNumber = 1;
-                        bool success = true;
-                        int retryCount = 0;
+                        var fileInfo = new FileInfo(localFilePath);
+                        long fileLength = fileInfo.Length;
+                        long transferred = 0;
 
-                        _udpClient = new UdpClient();
-                        _udpClient.Client.ReceiveTimeout = TIMEOUT_MS;
-                        _udpClient.Client.SendTimeout = TIMEOUT_MS;
+                        OnProgress?.Invoke(this, $"📡 TFTP: Подключение к {_serverIp}:69");
+                        OnProgress?.Invoke(this, $"📦 TFTP: Отправка {remoteFileName} ({fileLength} байт)");
 
-                        IPEndPoint serverEndPoint = new IPEndPoint(IPAddress.Parse(_serverIp), TFTP_PORT);
+                        client.Client.SendTimeout = TIMEOUT;
+                        client.Client.ReceiveTimeout = TIMEOUT;
 
-                        // шаг 1 - отправка WRQ (Write Request)
-                        byte[] wrqPacket = CreateWriteRequest(remoteFileName);
-                        OnProgress?.Invoke(this, $"📨 TFTP: Отправка WRQ запроса...");
+                        // 1. Отправляем WRQ (Write Request)
+                        byte[] wrqPacket = BuildWRQPacket(remoteFileName);
+                        client.Send(wrqPacket, wrqPacket.Length, _serverIp, TFTP_PORT);
 
-                        _udpClient.Send(wrqPacket, wrqPacket.Length, serverEndPoint);
+                        IPEndPoint remoteEp = new IPEndPoint(IPAddress.Parse(_serverIp), TFTP_PORT);
+                        byte[] ackBuffer = client.Receive(ref remoteEp);
 
-                        // шаг 2 - получение ACK от сервера
-                        try
+                        if (ackBuffer.Length < 4)
                         {
-                            IPEndPoint remoteEp = new IPEndPoint(IPAddress.Any, 0);
-                            byte[] ackBuffer = _udpClient.Receive(ref remoteEp);
-
-                            if (!IsAck(ackBuffer, 0))
-                            {
-                                OnError?.Invoke(this, "❌ TFTP: Не получен ACK на WRQ");
-                                return false;
-                            }
-
-                            serverEndPoint = remoteEp;
-                            OnProgress?.Invoke(this, $"✅ TFTP: Сервер готов, начинаем передачу...");
-                        }
-                        catch (IOException)
-                        {
-                            OnError?.Invoke(this, "❌ TFTP: Таймаут при получении ACK на WRQ");
+                            OnError?.Invoke(this, "❌ TFTP: Ошибка подтверждения начала передачи");
                             return false;
                         }
 
-                        // шаг 3 - передача блоков данных
-                        long totalBytesSent = 0;
+                        short blockNum = 0;
 
-                        while ((bytesRead = fileStream.Read(buffer, 0, BLOCK_SIZE)) > 0)
+                        // 2. Читаем файл блоками и отправляем
+                        using (var fileStream = File.OpenRead(localFilePath))
                         {
-                            byte[] dataPacket = CreateDataPacket(blockNumber, buffer, bytesRead);
+                            byte[] buffer = new byte[BLOCK_SIZE];
+                            int bytesRead;
 
-                            // повтор отправки, если нет ответа
-                            for (int attempt = 0; attempt < MAX_RETRIES; attempt++)
+                            while ((bytesRead = fileStream.Read(buffer, 0, BLOCK_SIZE)) > 0)
                             {
-                                try
+                                blockNum++;
+                                byte[] dataPacket = BuildDATAPacket(blockNum, buffer, bytesRead);
+
+                                client.Send(dataPacket, dataPacket.Length, remoteEp);
+
+                                // Ждём ACK
+                                ackBuffer = client.Receive(ref remoteEp);
+                                if (ackBuffer.Length >= 4)
                                 {
-                                    _udpClient.Send(dataPacket, dataPacket.Length, serverEndPoint);
-                                    totalBytesSent += bytesRead;
-
-                                    // Получаем ACK
-                                    IPEndPoint remoteEp = new IPEndPoint(IPAddress.Any, 0);
-                                    byte[] ackBuffer = _udpClient.Receive(ref remoteEp);
-
-                                    if (IsAck(ackBuffer, blockNumber))
+                                    short ackNum = (short)((ackBuffer[2] << 8) | ackBuffer[3]);
+                                    if (ackNum != blockNum)
                                     {
-                                        double progressPercent = (totalBytesSent / (double)fileLength) * 100;
-                                        OnProgress?.Invoke(this,
-                                            $"📊 TFTP: {totalBytesSent}/{fileLength} байт ({progressPercent:F1}%) [блок {blockNumber}]");
-                                        break;
+                                        OnError?.Invoke(this, $"❌ TFTP: Ошибка номера блока (ожидалось {blockNum}, получено {ackNum})");
+                                        return false;
                                     }
                                 }
-                                catch (IOException)
-                                {
-                                    if (attempt == MAX_RETRIES - 1)
-                                    {
-                                        OnError?.Invoke(this, $"❌ TFTP: Ошибка передачи блока {blockNumber}");
-                                        success = false;
-                                        break;
-                                    }
-                                    OnProgress?.Invoke(this, $"⚠️  TFTP: Повтор блока {blockNumber}...");
-                                }
+
+                                transferred += bytesRead;
+                                double percent = (transferred / (double)fileLength) * 100;
+                                OnProgress?.Invoke(this, $"📊 TFTP: {percent:F1}% ({transferred}/{fileLength} байт)");
                             }
-
-                            if (!success) break;
-
-                            blockNumber++;
-                            if (blockNumber > 65535) blockNumber = 1;
-
-                            if (bytesRead < BLOCK_SIZE) break; // последний блок
                         }
 
-                        _udpClient?.Close();
-
-                        if (success)
-                        {
-                            OnSuccess?.Invoke(this,
-                                $"✅ TFTP: Файл {remoteFileName} успешно передан ({totalBytesSent} байт)");
-                            return true;
-                        }
-                        else
-                        {
-                            OnError?.Invoke(this, "❌ TFTP: Ошибка при передаче файла");
-                            return false;
-                        }
+                        OnSuccess?.Invoke(this, $"✅ TFTP: Файл {remoteFileName} успешно передан ({fileLength} байт)");
+                        return true;
                     }
-                }
-                catch (Exception ex)
-                {
-                    OnError?.Invoke(this, $"❌ TFTP: {ex.Message}");
-                    return false;
-                }
-                finally
-                {
-                    _udpClient?.Close();
+                    catch (Exception ex)
+                    {
+                        OnError?.Invoke(this, $"❌ TFTP Upload: {ex.Message}");
+                        return false;
+                    }
                 }
             });
         }
 
         /// <summary>
-        /// получение файла с устройства через TFTP
+        /// DOWNLOAD файла (GET файла с сервера)
         /// </summary>
         public async Task<bool> ReceiveFileAsync(string remoteFileName, string localFilePath)
         {
             return await Task.Run(() =>
             {
-                try
+                using (var client = new UdpClient())
                 {
-                    OnProgress?.Invoke(this, $"📥 TFTP: Загрузка файла {remoteFileName} с {_serverIp}...");
-
-                    using (var fileStream = new FileStream(localFilePath, FileMode.Create, FileAccess.Write))
+                    try
                     {
-                        _udpClient = new UdpClient();
-                        _udpClient.Client.ReceiveTimeout = TIMEOUT_MS;
-                        _udpClient.Client.SendTimeout = TIMEOUT_MS;
+                        OnProgress?.Invoke(this, $"📥 TFTP: Загрузка {remoteFileName} с {_serverIp}...");
 
-                        IPEndPoint serverEndPoint = new IPEndPoint(IPAddress.Parse(_serverIp), TFTP_PORT);
+                        client.Client.SendTimeout = TIMEOUT;
+                        client.Client.ReceiveTimeout = TIMEOUT;
 
-                        // отправка RRQ (Read Request)
-                        byte[] rrqPacket = CreateReadRequest(remoteFileName);
-                        _udpClient.Send(rrqPacket, rrqPacket.Length, serverEndPoint);
-                        OnProgress?.Invoke(this, $"📨 TFTP: Отправка RRQ запроса...");
+                        // 1. Отправляем RRQ (Read Request)
+                        byte[] rrqPacket = BuildRRQPacket(remoteFileName);
+                        client.Send(rrqPacket, rrqPacket.Length, _serverIp, TFTP_PORT);
 
-                        IPEndPoint remoteEp = new IPEndPoint(IPAddress.Any, 0);
-                        long totalBytesReceived = 0;
-                        ushort expectedBlockNumber = 1;
+                        IPEndPoint remoteEp = new IPEndPoint(IPAddress.Parse(_serverIp), TFTP_PORT);
+                        long totalReceived = 0;
 
-                        while (true)
+                        // 2. Получаем файл блоками
+                        using (var fileStream = File.Create(localFilePath))
                         {
-                            try
-                            {
-                                byte[] dataBuffer = _udpClient.Receive(ref remoteEp);
+                            short lastBlockNum = 0;
 
-                                if (IsData(dataBuffer, expectedBlockNumber))
+                            while (true)
+                            {
+                                byte[] dataBuffer = client.Receive(ref remoteEp);
+
+                                if (dataBuffer.Length < 4)
+                                    break;
+
+                                short opCode = (short)((dataBuffer[0] << 8) | dataBuffer[1]);
+                                short blockNum = (short)((dataBuffer[2] << 8) | dataBuffer[3]);
+
+                                // Отправляем ACK
+                                byte[] ackPacket = BuildACKPacket(blockNum);
+                                client.Send(ackPacket, ackPacket.Length, remoteEp);
+
+                                if (opCode == 3) // DATA packet
                                 {
                                     int dataLength = dataBuffer.Length - 4;
                                     fileStream.Write(dataBuffer, 4, dataLength);
-                                    totalBytesReceived += dataLength;
+                                    totalReceived += dataLength;
 
-                                    OnProgress?.Invoke(this,
-                                        $"📥 TFTP: {totalBytesReceived} байт [блок {expectedBlockNumber}]");
+                                    OnProgress?.Invoke(this, $"📥 TFTP: {totalReceived} байт");
 
-                                    // отправка ACK
-                                    byte[] ackPacket = CreateAck(expectedBlockNumber);
-                                    _udpClient.Send(ackPacket, ackPacket.Length, remoteEp);
-
+                                    // Если блок меньше размера, это последний блок
                                     if (dataLength < BLOCK_SIZE)
-                                    {
-                                        OnSuccess?.Invoke(this,
-                                            $"✅ TFTP: Файл загружен успешно ({totalBytesReceived} байт)");
-                                        return true;
-                                    }
+                                        break;
 
-                                    expectedBlockNumber++;
-                                    if (expectedBlockNumber > 65535) expectedBlockNumber = 1;
+                                    lastBlockNum = blockNum;
                                 }
                             }
-                            catch (IOException)
-                            {
-                                OnError?.Invoke(this, "❌ TFTP: Таймаут при получении данных");
-                                return false;
-                            }
                         }
+
+                        OnSuccess?.Invoke(this, $"✅ TFTP: Файл загружен ({totalReceived} байт) → {localFilePath}");
+                        return true;
                     }
-                }
-                catch (Exception ex)
-                {
-                    OnError?.Invoke(this, $"❌ TFTP: Ошибка загрузки: {ex.Message}");
-                    return false;
-                }
-                finally
-                {
-                    _udpClient?.Close();
+                    catch (Exception ex)
+                    {
+                        OnError?.Invoke(this, $"❌ TFTP Download: {ex.Message}");
+                        return false;
+                    }
                 }
             });
         }
 
-        // ==================== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ====================
+        #region TFTP Packet Builders
 
-        private byte[] CreateWriteRequest(string filename)
+        /// <summary>
+        /// Построить WRQ (Write Request) пакет
+        /// Формат: opcode (2 байта) + filename + 0 + mode + 0
+        /// </summary>
+        private byte[] BuildWRQPacket(string filename)
         {
             using (var ms = new MemoryStream())
             {
                 ms.WriteByte(0x00);
-                ms.WriteByte(0x02);
-                ms.Write(System.Text.Encoding.ASCII.GetBytes(filename), 0, filename.Length);
-                ms.WriteByte(0x00);
-                ms.Write(System.Text.Encoding.ASCII.GetBytes("octet"), 0, 5);
-                ms.WriteByte(0x00);
+                ms.WriteByte(0x02); // WRQ opcode
+                WriteString(ms, filename);
+                WriteString(ms, "octet"); // Binary mode
                 return ms.ToArray();
             }
         }
 
-        private byte[] CreateReadRequest(string filename)
+        /// <summary>
+        /// Построить RRQ (Read Request) пакет
+        /// Формат: opcode (2 байта) + filename + 0 + mode + 0
+        /// </summary>
+        private byte[] BuildRRQPacket(string filename)
         {
             using (var ms = new MemoryStream())
             {
                 ms.WriteByte(0x00);
-                ms.WriteByte(0x01);
-                ms.Write(System.Text.Encoding.ASCII.GetBytes(filename), 0, filename.Length);
-                ms.WriteByte(0x00);
-                ms.Write(System.Text.Encoding.ASCII.GetBytes("octet"), 0, 5);
-                ms.WriteByte(0x00);
+                ms.WriteByte(0x01); // RRQ opcode
+                WriteString(ms, filename);
+                WriteString(ms, "octet"); // Binary mode
                 return ms.ToArray();
             }
         }
 
-        private byte[] CreateDataPacket(ushort blockNumber, byte[] data, int length)
+        /// <summary>
+        /// Построить DATA пакет
+        /// Формат: opcode (2) + block# (2) + data (0-512)
+        /// </summary>
+        private byte[] BuildDATAPacket(short blockNum, byte[] data, int length)
         {
-            byte[] packet = new byte[length + 4];
+            byte[] packet = new byte[4 + length];
             packet[0] = 0x00;
-            packet[1] = 0x03;
-            packet[2] = (byte)((blockNumber >> 8) & 0xFF);
-            packet[3] = (byte)(blockNumber & 0xFF);
+            packet[1] = 0x03; // DATA opcode
+            packet[2] = (byte)(blockNum >> 8);
+            packet[3] = (byte)(blockNum & 0xFF);
             Array.Copy(data, 0, packet, 4, length);
             return packet;
         }
 
-        private byte[] CreateAck(ushort blockNumber)
+        /// <summary>
+        /// Построить ACK (Acknowledgement) пакет
+        /// Формат: opcode (2) + block# (2)
+        /// </summary>
+        private byte[] BuildACKPacket(short blockNum)
         {
-            byte[] ack = new byte[4];
-            ack[0] = 0x00;
-            ack[1] = 0x04;
-            ack[2] = (byte)((blockNumber >> 8) & 0xFF);
-            ack[3] = (byte)(blockNumber & 0xFF);
-            return ack;
+            byte[] packet = new byte[4];
+            packet[0] = 0x00;
+            packet[1] = 0x04; // ACK opcode
+            packet[2] = (byte)(blockNum >> 8);
+            packet[3] = (byte)(blockNum & 0xFF);
+            return packet;
         }
 
-        private bool IsAck(byte[] packet, ushort expectedBlock)
+        /// <summary>
+        /// Записать строку в TFTP формате (строка + null terminator)
+        /// </summary>
+        private void WriteString(MemoryStream ms, string str)
         {
-            if (packet.Length < 4 || packet[0] != 0x00 || packet[1] != 0x04)
-                return false;
-
-            ushort blockNumber = (ushort)(((packet[2] & 0xFF) << 8) | (packet[3] & 0xFF));
-            return blockNumber == expectedBlock;
+            byte[] strBytes = System.Text.Encoding.ASCII.GetBytes(str);
+            ms.Write(strBytes, 0, strBytes.Length);
+            ms.WriteByte(0x00);
         }
 
-        private bool IsData(byte[] packet, ushort expectedBlock)
-        {
-            if (packet.Length < 4 || packet[0] != 0x00 || packet[1] != 0x03)
-                return false;
-
-            ushort blockNumber = (ushort)(((packet[2] & 0xFF) << 8) | (packet[3] & 0xFF));
-            return blockNumber == expectedBlock;
-        }
+        #endregion
 
         public void Dispose()
         {
             if (!_disposed)
             {
-                _udpClient?.Close();
-                _udpClient?.Dispose();
                 _disposed = true;
             }
         }
