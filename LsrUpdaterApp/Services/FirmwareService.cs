@@ -14,279 +14,276 @@ namespace LsrUpdaterApp.Services
     /// </summary>
     public class FirmwareService
     {
-        private const string FirmwareDirName = "firmware";
-        private const string LsrSubDirName = "lsr4";
+        private readonly BkrCommandExecutor _bkrExecutor;
+        private bool _disposed;
 
-        /// <summary>
-        /// событие об ошибке
-        /// </summary>
+        public event EventHandler<string> OnLog;
         public event EventHandler<string> OnError;
 
-        /// <summary>
-        /// событие с информационным сообщением 
-        /// </summary>
-        public event EventHandler<string> OnInfo;
-
-        /// <summary>
-        /// получение пути к директории хранения прошивок
-        /// </summary>
-        /// <returns></returns>
-        public string GetFirmwareDirectory()
+        public FirmwareService(string bkrIp = "10.0.1.89", int bkrPort = 3456)
         {
-            string homeDir  = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-            string firmwareDir = Path.Combine(homeDir,FirmwareDirName, LsrSubDirName);
-            return firmwareDir;
+            _bkrExecutor = new BkrCommandExecutor(bkrIp, bkrPort);
+            _bkrExecutor.OnLog += (s, msg) => OnLog?.Invoke(this, msg);
+            _bkrExecutor.OnError += (s, msg) => OnError?.Invoke(this, msg);
         }
 
-        /// <summary>
-        /// создание директории для хранения прошивок
-        /// </summary>
-        /// <returns></returns>
-        public bool CreateFirmwareDirectory()
+        public async Task<List<LsrInfo>> GetAllLsrInfoAsync()
         {
             try
             {
-                string firmwareDir = GetFirmwareDirectory();
-                if (!Directory.Exists(firmwareDir))
+                Log("");
+                Log("╔════════════════════════════════════════════════════╗");
+                Log("║  ПОЛУЧЕНИЕ ИНФОРМАЦИИ О ЛСР                        ║");
+                Log("╚════════════════════════════════════════════════════╝");
+                Log("");
+
+                if (!await _bkrExecutor.ConnectAsync())
+                    return new List<LsrInfo>();
+
+                if (!await _bkrExecutor.StopPhyAsync())
                 {
-                    Directory.CreateDirectory(firmwareDir);
-                    OnInfo?.Invoke(this, $"✅ Директория создана: {firmwareDir}");
+                    _bkrExecutor.Disconnect();
+                    return new List<LsrInfo>();
                 }
-                else
+
+                await Task.Delay(2000);
+
+                if (!await _bkrExecutor.ClearLsrPollAsync())
                 {
-                    OnInfo?.Invoke(this, $"✅ Директория существует: {firmwareDir}");
+                    _bkrExecutor.Disconnect();
+                    return new List<LsrInfo>();
                 }
-                return true;
+
+                if (!await _bkrExecutor.PollLsrAsync())
+                {
+                    _bkrExecutor.Disconnect();
+                    return new List<LsrInfo>();
+                }
+
+                if (!await _bkrExecutor.WaitForStatisticsAsync(60))
+                {
+                    _bkrExecutor.Disconnect();
+                    return new List<LsrInfo>();
+                }
+
+                if (!await _bkrExecutor.EnablePromiscuousModeAsync())
+                {
+                    _bkrExecutor.Disconnect();
+                    return new List<LsrInfo>();
+                }
+
+                await Task.Delay(1000);
+
+                var lsrList = await _bkrExecutor.GetLsrListVersionsAsync();
+
+                foreach (var lsr in lsrList)
+                {
+                    if (ushort.TryParse(lsr.Id, System.Globalization.NumberStyles.HexNumber, null, out ushort maupNum))
+                    {
+                        string ipAddr = await _bkrExecutor.GetLsrIpAddressAsync(maupNum);
+                        if (!string.IsNullOrEmpty(ipAddr))
+                            lsr.IpAddress = ipAddr;
+
+                        var sysInfo = await _bkrExecutor.GetLsrSysInfoAsync(maupNum);
+                        if (sysInfo.ContainsKey("Status"))
+                            lsr.Status = sysInfo["Status"];
+
+                        Log($"  📋 {lsr.ToLogString()}");
+                    }
+
+                    await Task.Delay(500);
+                }
+
+                await _bkrExecutor.DisablePromiscuousModeAsync();
+                await Task.Delay(1000);
+                await _bkrExecutor.StartPhyAsync();
+
+                _bkrExecutor.Disconnect();
+
+                Log("");
+                Log("✅✅✅ Получение информации завершено! ✅✅✅");
+                Log("");
+
+                return lsrList;
             }
             catch (Exception ex)
             {
-                OnError?.Invoke(this, $"Ошибка создания директории: {ex.Message}");
-                return false;
+                LogError($"❌ ОШИБКА: {ex.Message}");
+                _bkrExecutor.Disconnect();
+                return new List<LsrInfo>();
             }
         }
 
-        /// <summary>
-        /// копирование файла прошивки в целевую директорию
-        /// </summary>
-        /// <param name="sourcePath"></param>
-        /// <returns></returns>
-        public async Task<bool> CopyFirmwareFileAsync(string sourcePath)
+        public async Task<bool> RollbackFirmwareAsync(LsrInfo lsr)
         {
-            return await Task.Run(() =>
+            try
             {
-                try
+                Log("");
+                Log("╔════════════════════════════════════════════════════╗");
+                Log("║  ОТКАТ ПРОШИВКИ ЛСР                                ║");
+                Log("╚════════════════════════════════════════════════════╝");
+                Log("");
+                Log($"🔄 Откат прошивки для {lsr.ToLogString()}");
+                Log("");
+
+                if (!await _bkrExecutor.ConnectAsync())
+                    return false;
+
+                if (!await _bkrExecutor.InitializeBkrAsync())
                 {
-                    if (!File.Exists(sourcePath))
-                    {
-                        OnError?.Invoke(this, $"Файл не найден: {sourcePath}");
-                        return false;
-                    }
-
-                    CreateFirmwareDirectory();
-
-                    string targetDir = GetFirmwareDirectory();
-                    string fileName = Path.GetFileName(sourcePath);
-                    string targetPath = Path.Combine(targetDir, fileName);
-
-                    //копирование с перезаписью
-                    File.Copy(sourcePath, targetPath, true);
-                    OnInfo?.Invoke(this, $"✅ Файл скопирован: {targetPath}");
-                    return true;
-                }
-                catch (Exception ex)
-                {
-                    OnError?.Invoke(this, $"Ошибка копирования файла: {ex.Message}");
+                    _bkrExecutor.Disconnect();
                     return false;
                 }
-            });
-        }
 
-        /// <summary>
-        /// получить FirmwareInfo объект с информацией о файле
-        /// </summary>
-        public FirmwareInfo GetFirmwareInfo(string sourcePath)
-        {
-            try
-            {
-                if (!File.Exists(sourcePath))
+                if (!ushort.TryParse(lsr.Id, System.Globalization.NumberStyles.HexNumber, null, out ushort maupNum))
                 {
-                    OnError?.Invoke(this, $"Файл не найден: {sourcePath}");
-                    return null;
+                    LogError("❌ Неверный ID ЛСР");
+                    _bkrExecutor.Disconnect();
+                    return false;
                 }
 
-                var info = new FirmwareInfo(sourcePath);
+                Log("");
+                Log("═══════════════════════════════════════════════════════");
+                Log("ПОДГОТОВКА К ОТКАТУ");
+                Log("═══════════════════════════════════════════════════════");
+                Log("");
 
-                // расчет MD5 хеша
-                info.Md5Hash = CalculateMd5(sourcePath);
-
-                OnInfo?.Invoke(this, $"📦 Информация о прошивке: {info}");
-                return info;
-            }
-            catch (Exception ex)
-            {
-                OnError?.Invoke(this, $"Ошибка получения информации о файле: {ex.Message}");
-                return null;
-            }
-        }
-
-        /// <summary>
-        /// получить путь к скопированному файлу прошивки в директории
-        /// </summary>
-        public string GetFirmwareFilePath(string fileName)
-        {
-            string firmwareDir = GetFirmwareDirectory();
-            return Path.Combine(firmwareDir, fileName);
-        }
-
-        /// <summary>
-        /// проверка на существование файла прошивки в директории
-        /// </summary>
-        public bool FirmwareFileExists(string fileName)
-        {
-            string filePath = GetFirmwareFilePath(fileName);
-            return File.Exists(filePath);
-        }
-
-        /// <summary>
-        /// получение размера файла прошивки в байтах
-        /// </summary>
-        public long GetFirmwareFileSize(string fileName)
-        {
-            try
-            {
-                string filePath = GetFirmwareFilePath(fileName);
-                if (File.Exists(filePath))
+                if (!await _bkrExecutor.SetIwdgAsync(maupNum, 3600))
                 {
-                    var fileInfo = new FileInfo(filePath);
-                    return fileInfo.Length;
+                    _bkrExecutor.Disconnect();
+                    return false;
                 }
-                return 0;
-            }
-            catch
-            {
-                return 0;
-            }
-        }
 
-        /// <summary>
-        /// получение размера файла в MB (читаемый формат)
-        /// </summary>
-        public string GetFirmwareFileSizeFormatted(string fileName)
-        {
-            long bytes = GetFirmwareFileSize(fileName);
-            if (bytes == 0) return "0 MB";
+                await Task.Delay(1000);
 
-            double mb = bytes / (1024.0 * 1024.0);
-            return $"{mb:F2} MB";
-        }
-
-        /// <summary>
-        /// удаление файла прошивки из директории
-        /// </summary>
-        public bool DeleteFirmwareFile(string fileName)
-        {
-            try
-            {
-                string filePath = GetFirmwareFilePath(fileName);
-                if (File.Exists(filePath))
+                if (!await _bkrExecutor.ResetLsrAsync(maupNum))
                 {
-                    File.Delete(filePath);
-                    OnInfo?.Invoke(this, $"✅ Файл удален: {filePath}");
-                    return true;
+                    _bkrExecutor.Disconnect();
+                    return false;
                 }
-                return false;
-            }
-            catch (Exception ex)
-            {
-                OnError?.Invoke(this, $"Ошибка удаления файла: {ex.Message}");
-                return false;
-            }
-        }
 
-        /// <summary>
-        /// открыть директорию с прошивками в проводнике
-        /// </summary>
-        public bool OpenFirmwareDirectory()
-        {
-            try
-            {
-                string firmwareDir = GetFirmwareDirectory();
-                CreateFirmwareDirectory();
-
-                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                string ipAddr = await _bkrExecutor.GetLsrIpAddressAsync(maupNum);
+                if (string.IsNullOrEmpty(ipAddr))
                 {
-                    FileName = firmwareDir,
-                    UseShellExecute = true
-                });
+                    LogError("❌ ЛСР не отвечает");
+                    _bkrExecutor.Disconnect();
+                    return false;
+                }
+
+                if (await _bkrExecutor.CheckWwdgStatusAsync(maupNum))
+                {
+                    Log("⚙️  WWDG включен, отключаем...");
+
+                    if (!await _bkrExecutor.DisableWwdgAsync(maupNum))
+                    {
+                        Log("⚠️ Ошибка при отключении WWDG, продолжаем...");
+                    }
+
+                    if (!await _bkrExecutor.ResetLsrAsync(maupNum))
+                    {
+                        LogError("⚠️ Ошибка при сбросе, продолжаем...");
+                    }
+                    await Task.Delay(2000);
+                }
+
+                Log("");
+                Log("═══════════════════════════════════════════════════════");
+                Log("ОТКАТ ЧЕРЕЗ FLASH ERASE");
+                Log("═══════════════════════════════════════════════════════");
+                Log("");
+
+                Log("🔥 Выполняем откат прошивки через очистку флешки...");
+                Log("   (ЛСР загрузится с версией, хранящейся в ПЗУ)");
+
+                if (!await _bkrExecutor.EraseFlashAsync(maupNum))
+                {
+                    LogError("⚠️ Ошибка при очистке флешки, пытаемся продолжить...");
+                }
+
+                await Task.Delay(2000);
+
+                Log("");
+                Log("═══════════════════════════════════════════════════════");
+                Log("ФИНАЛИЗАЦИЯ");
+                Log("═══════════════════════════════════════════════════════");
+                Log("");
+
+                if (!await _bkrExecutor.DisableIwdgAsync(maupNum))
+                {
+                    LogError("⚠️ Ошибка при отключении IWDG, продолжаем...");
+                }
+
+                if (!await _bkrExecutor.ResetLsrAsync(maupNum))
+                {
+                    LogError("⚠️ Ошибка при финальном сбросе, продолжаем...");
+                }
+
+                await Task.Delay(3000);
+
+                if (!await _bkrExecutor.FinalizeBkrAsync())
+                {
+                    LogError("⚠️ Ошибка при финализации БКР");
+                }
+
+                _bkrExecutor.Disconnect();
+
+                Log("");
+                Log("╔════════════════════════════════════════════════════╗");
+                Log($"║  ОТКАТ ЛСР {lsr.Id} ЗАВЕРШЁН!                       ║");
+                Log("╚════════════════════════════════════════════════════╝");
+                Log("");
+                Log("⚠️  ВНИМАНИЕ: После отката ЛСР загрузится со встроенной версией");
+                Log($"   Для установки новой версии выполните перепрошивку!");
+                Log("");
+
                 return true;
             }
             catch (Exception ex)
             {
-                OnError?.Invoke(this, $"Ошибка открытия директории: {ex.Message}");
+                LogError($"❌ КРИТИЧЕСКАЯ ОШИБКА: {ex.Message}");
+                _bkrExecutor.Disconnect();
                 return false;
             }
         }
 
-        /// <summary>
-        /// получение списока всех файлов прошивок в директории
-        /// </summary>
-        public string[] GetAllFirmwareFiles()
+        public async Task<(int total, int needsUpdate, int upToDate, int unavailable)> GetStatisticsAsync()
         {
-            try
-            {
-                string firmwareDir = GetFirmwareDirectory();
-                CreateFirmwareDirectory();
+            var lsrList = await GetAllLsrInfoAsync();
 
-                if (Directory.Exists(firmwareDir))
-                {
-                    return Directory.GetFiles(firmwareDir, "*.bin");
-                }
-                return Array.Empty<string>();
-            }
-            catch (Exception ex)
+            int total = lsrList.Count;
+            int needsUpdate = 0;
+            int upToDate = 0;
+            int unavailable = 0;
+
+            foreach (var lsr in lsrList)
             {
-                OnError?.Invoke(this, $"Ошибка получения списка файлов: {ex.Message}");
-                return Array.Empty<string>();
+                if (!lsr.IsAvailable)
+                    unavailable++;
+                else if (lsr.NeedsUpdate)
+                    needsUpdate++;
+                else
+                    upToDate++;
             }
+
+            return (total, needsUpdate, upToDate, unavailable);
         }
 
-        /// <summary>
-        /// вычисление MD5 хеша файла для проверки целостности
-        /// </summary>
-        /// <param name="filePath"></param>
-        /// <returns></returns>
-        private string CalculateMd5(string filePath)
+        private void Log(string message)
         {
-            try
-            {
-                using (var md5 = MD5.Create())
-                {
-                    using (var stream = File.OpenRead(filePath))
-                    {
-                        var hash = md5.ComputeHash(stream);
-                        return BitConverter.ToString(hash).Replace("-", "").ToLower();
-                    }
-                }
-            }
-            catch
-            {
-                return string.Empty;
-            }
+            OnLog?.Invoke(this, message);
         }
 
-        /// <summary>
-        /// проверка целостности файла по MD5 хешу
-        /// </summary>
-        public bool VerifyFileIntegrity(string filePath, string expectedHash)
+        private void LogError(string message)
         {
-            try
+            OnError?.Invoke(this, message);
+        }
+
+        public void Dispose()
+        {
+            if (!_disposed)
             {
-                string actualHash = CalculateMd5(filePath);
-                return actualHash.Equals(expectedHash, StringComparison.OrdinalIgnoreCase);
-            }
-            catch
-            {
-                return false;
+                _bkrExecutor?.Dispose();
+                _disposed = true;
             }
         }
     }

@@ -1,226 +1,191 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Linq;
-using System.Text;
 using System.Text.RegularExpressions;
-using System.Threading.Tasks;
 using LsrUpdaterApp.Models;
 
 namespace LsrUpdaterApp.Services
 {
-    /// <summary>
-    /// сервис для парсинга ответов от БКР
-    /// </summary>
     public class BkrCommandParser
     {
-        /// <summary>
-        /// событие об ошибке парсинга
-        /// </summary>
-        public event EventHandler<string> OnParsingError;
-
-        /// <summary>
-        /// парсинг ответа команды "lsr llv" (list last versions)
-        /// возвращает список ЛСР с информацией о версиях 
-        /// </summary>
-        /// <param name="responseData"></param>
-        /// <returns></returns>
-        public List<LsrInfo> ParserLsrListVersions(string responseData)
+        public bool IsErrorResponse(string response)
         {
-            var lsrList = new List<LsrInfo>();
+            if (string.IsNullOrEmpty(response))
+                return true;
 
-            try
-            {
-                if (string.IsNullOrEmpty(responseData))
-                    return lsrList;
-
-                string[] lines = responseData.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None);
-                Regex regex = new Regex(@"lsr\s+(\d+)\s+\(([^)]+)\):\s+(.+)");
-
-                foreach (string line in lines)
-                {
-                    if (string.IsNullOrWhiteSpace(line) || !line.Contains("lsr"))
-                        continue;
-
-                    Match match = regex.Match(line);
-                    if (match.Success && match.Groups.Count >= 4)
-                    {
-                        try
-                        {
-                            string id = match.Groups[1].Value.Trim();
-                            string ip = match.Groups[2].Value.Trim();
-                            string version = match.Groups[3].Value.Trim();
-
-                            var lsr = new LsrInfo(id, ip, version);
-                            lsrList.Add(lsr);
-                        }
-                        catch (Exception ex)
-                        {
-                            OnParsingError?.Invoke(this, $"Ошибка парсинга строки '{line}': {ex.Message}");
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                OnParsingError?.Invoke(this, $"Критическая ошибка парсинга: {ex.Message}");
-            }
-
-            return lsrList;
+            response = response.ToLower();
+            return response.Contains("error") ||
+                   response.Contains("err") ||
+                   response.Contains("fail") ||
+                   response.Contains("unknown") ||
+                   response.Contains("invalid");
         }
 
-        /// <summary>
-        /// парсинг ответа команды "bkr" (проверка статуса сбора)
-        /// возвращает статус сбора: 0 = завершен, 4 = в процессе 
-        /// </summary>
-        /// <param name="responseData"></param>
-        /// <returns></returns>
-        public int ParseBkrStatus(string responseData)
+        public string ExtractErrorMessage(string response)
         {
-            try
-            {
-                if (string.IsNullOrEmpty(responseData))
-                    return -1;
+            if (string.IsNullOrEmpty(response))
+                return "Пустой ответ";
 
-                // ищем паттерн [0] 0 или [0] 4
-                Regex regex = new Regex(@"\[0\]\s+(\d+)");
-                Match match = regex.Match(responseData);
+            var match = Regex.Match(response, @"(?:error|err|fail):\s*(.+?)(?:\n|$)", RegexOptions.IgnoreCase);
+            if (match.Success)
+                return match.Groups[1].Value.Trim();
 
-                if (match.Success)
-                {
-                    if (int.TryParse(match.Groups[1].Value, out int status))
-                    {
-                        return status; // 0 = завершен, 4 = в процессе
-                    }
-                }
-            }
-            catch (Exception ex)
+            match = Regex.Match(response, @"(?:error|err|fail)\s*(.+?)$", RegexOptions.IgnoreCase | RegexOptions.Multiline);
+            if (match.Success)
+                return match.Groups[1].Value.Trim();
+
+            var lines = response.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
+            return lines.Length > 0 ? lines[0] : response;
+        }
+
+        public int ParseBkrStatus(string response)
+        {
+            if (string.IsNullOrEmpty(response))
+                return -1;
+
+            var match = Regex.Match(response, @"\[(\d+)\]\s+(\d+)");
+            if (match.Success)
             {
-                OnParsingError?.Invoke(this, $"Ошибка парсинга BKR статуса: {ex.Message}");
+                if (int.TryParse(match.Groups[2].Value, out int status))
+                    return status;
             }
 
             return -1;
         }
 
-        /// <summary>
-        /// парсинг ответа команды "exe 2561 phy ipaddr" (получить IP адрес)
-        /// </summary>
-        public string ParsePhyIpAddr(string responseData)
+        public List<LsrInfo> ParserLsrListVersions(string response)
         {
+            var lsrList = new List<LsrInfo>();
+
+            if (string.IsNullOrEmpty(response))
+                return lsrList;
+
             try
             {
-                if (string.IsNullOrEmpty(responseData))
-                    return string.Empty;
+                var lines = response.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
 
-                // Ищем IP адрес в формате XXX.XXX.XXX.XXX
-                Regex regex = new Regex(@"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})");
-                Match match = regex.Match(responseData);
-
-                if (match.Success)
+                foreach (var line in lines)
                 {
-                    return match.Groups[1].Value;
+                    var trimmed = line.Trim();
+                    if (string.IsNullOrEmpty(trimmed))
+                        continue;
+
+                    var parts = trimmed.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+
+                    if (parts.Length >= 3)
+                    {
+                        string id = parts[0];
+                        string ip = parts[1];
+                        string version = parts[2];
+
+                        if (version.Contains("?"))
+                            continue;
+
+                        var lsr = new LsrInfo(id, ip, version)
+                        {
+                            NeedsUpdate = true,
+                            IsAvailable = true,
+                            Status = "🆗 Доступен"
+                        };
+
+                        lsrList.Add(lsr);
+                    }
                 }
             }
             catch (Exception ex)
             {
-                OnParsingError?.Invoke(this, $"Ошибка парсинга IP адреса: {ex.Message}");
+                Console.WriteLine($"⚠️ Ошибка парсинга списка ЛСР: {ex.Message}");
             }
 
-            return string.Empty;
+            return lsrList;
         }
 
-        /// <summary>
-        /// парсинг ответа команды "exe 2561 wwdg" (проверить WWDG)
-        /// возвращает true если WWDG включен (ответ содержит 1)
-        /// </summary>
-        public bool ParseWwdgStatus(string responseData)
+        public string ParsePhyIpAddr(string response)
         {
-            try
-            {
-                if (string.IsNullOrEmpty(responseData))
-                    return false;
+            if (string.IsNullOrEmpty(response))
+                return null;
 
-                // Ищем значение 1 или 0
-                if (responseData.Contains("1"))
-                    return true;
+            var match = Regex.Match(response, @"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})");
+            if (match.Success)
+                return match.Groups[1].Value;
 
-                return false;
-            }
-            catch (Exception ex)
-            {
-                OnParsingError?.Invoke(this, $"Ошибка парсинга WWDG статуса: {ex.Message}");
-                return false;
-            }
+            return null;
         }
 
-        /// <summary>
-        /// парсинг ответа команды "exe 2561 sys info" (системная информация)
-        /// возвращает словарь с информацией
-        /// </summary>
-        public Dictionary<string, string> ParseSysInfo(string responseData)
+        public bool ParseWwdgStatus(string response)
+        {
+            if (string.IsNullOrEmpty(response))
+                return false;
+
+            response = response.Trim();
+
+            if (response.Contains("1"))
+                return true;
+
+            if (response.Contains("0"))
+                return false;
+
+            var match = Regex.Match(response, @"[\[\s]([01])[\]\s]");
+            if (match.Success)
+                return match.Groups[1].Value == "1";
+
+            return false;
+        }
+
+        public Dictionary<string, string> ParseSysInfo(string response)
         {
             var info = new Dictionary<string, string>();
 
+            if (string.IsNullOrEmpty(response))
+                return info;
+
             try
             {
-                if (string.IsNullOrEmpty(responseData))
-                    return info;
+                var lines = response.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
 
-                string[] lines = responseData.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None);
-
-                foreach (string line in lines)
+                foreach (var line in lines)
                 {
-                    if (string.IsNullOrWhiteSpace(line) || !line.Contains(":"))
+                    var trimmed = line.Trim();
+                    if (string.IsNullOrEmpty(trimmed))
                         continue;
 
-                    string[] parts = line.Split(new[] { ":" }, StringSplitOptions.None);
-                    if (parts.Length >= 2)
+                    var match = Regex.Match(trimmed, @"^([^:=]+)[:=]\s*(.+)$");
+                    if (match.Success)
                     {
-                        string key = parts[0].Trim();
-                        string value = parts[1].Trim();
+                        string key = match.Groups[1].Value.Trim();
+                        string value = match.Groups[2].Value.Trim();
                         info[key] = value;
                     }
                 }
             }
             catch (Exception ex)
             {
-                OnParsingError?.Invoke(this, $"Ошибка парсинга sys info: {ex.Message}");
+                Console.WriteLine($"⚠️ Ошибка парсинга sys info: {ex.Message}");
             }
 
             return info;
         }
 
-        /// <summary>
-        /// проверка, указывает ли ответ на ошибку
-        /// </summary>
-        public bool IsErrorResponse(string responseData)
+        public bool IsSuccessResponse(string response)
         {
-            if (string.IsNullOrEmpty(responseData))
+            if (string.IsNullOrEmpty(response))
                 return false;
 
-            return responseData.Contains("Error")
-                || responseData.Contains("error")
-                || responseData.Contains("ERROR")
-                || responseData.Contains("failed")
-                || responseData.Contains("Failed")
-                || responseData.Contains("FAILED");
+            response = response.ToLower();
+            return response.Contains("ok") ||
+                   response.Contains("success") ||
+                   response.Contains("done") ||
+                   (!response.Contains("error") && !response.Contains("fail"));
         }
 
-        /// <summary>
-        /// получение сообщения об ошибке из ответа
-        /// </summary>
-        public string ExtractErrorMessage(string responseData)
+        public string NormalizeResponse(string response)
         {
-            if (string.IsNullOrEmpty(responseData))
+            if (string.IsNullOrEmpty(response))
                 return string.Empty;
 
-            // Ищем строки, содержащие ошибку
-            string[] lines = responseData.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None);
-            var errorLines = lines.Where(l => !string.IsNullOrWhiteSpace(l)
-                && (l.Contains("Error") || l.Contains("error")
-                || l.Contains("ERROR") || l.Contains("failed"))).ToList();
+            response = Regex.Replace(response, @"\x1B\[[0-9;]*m", "");
+            response = Regex.Replace(response, @"\s+", " ");
 
-            return string.Join(" | ", errorLines);
+            return response.Trim();
         }
     }
 }
-

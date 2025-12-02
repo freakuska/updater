@@ -1,58 +1,45 @@
-
 <Window xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         mc:Ignorable="d" d:DesignWidth="800" d:DesignHeight="450"
         x:Class="LsrUpdaterApp.MainWindow"
-        Title="LsrUpdaterApp" Width="700" Height="600">
-
-	<ScrollViewer>
-		<StackPanel Padding="20" Spacing="15">
-
-			<!-- ЗАГОЛОВОК -->
-			<TextBlock Text="🔧 Утилита обновления ЛСР"
-                       FontSize="24" FontWeight="Bold" Foreground="#1a1a1a"/>
-
-			<!-- ПАРАМЕТРЫ ПОДКЛЮЧЕНИЯ -->
-			<Border Background="#f5f5f5" CornerRadius="8" Padding="15"
+        Title="ЛСР Firmware Updater" Width="1000" Height="800">
+		
+	<ScrollViewer VerticalScrollBarVisibility="Auto">
+		<StackPanel Margin="20" Spacing="15">
+			<Border Background="#d0c3de" CornerRadius="8" Padding="15"
                     BorderBrush="#e5e7eb" BorderThickness="1">
 				<StackPanel Spacing="12">
 					<TextBlock Text="⚙️ Параметры подключения"
                               FontSize="14" FontWeight="Bold" Foreground="#1a1a1a"/>
-
 					<StackPanel Spacing="10">
 						<!-- IP БКР -->
 						<StackPanel Spacing="5">
 							<TextBlock Text="IP БКР:" FontSize="12" FontWeight="Medium"/>
-							<TextBox Text="{Binding BkrIpAddress}"
+							<TextBox x:Name="BkrIpBox"
                                     Watermark="10.0.1.89"
                                     Padding="8" Height="35"
                                     BorderThickness="1" BorderBrush="#d1d5db"
                                     CornerRadius="6"/>
 						</StackPanel>
-
-						<!-- Порт БКР -->
 						<StackPanel Spacing="5">
 							<TextBlock Text="Порт БКР:" FontSize="12" FontWeight="Medium"/>
-							<TextBox Text="{Binding BkrPort}"
+							<TextBox x:Name="BkrPortBox"
                                     Watermark="3456"
                                     Padding="8" Height="35"
                                     BorderThickness="1" BorderBrush="#d1d5db"
                                     CornerRadius="6"/>
 						</StackPanel>
-
-						<!-- Выбор файла прошивки -->
 						<StackPanel Spacing="5">
 							<TextBlock Text="Файл прошивки:" FontSize="12" FontWeight="Medium"/>
 							<DockPanel>
 								<Button DockPanel.Dock="Right" Content="📂 Выбрать"
-                                       Command="{Binding SelectFirmwareCommand}"
                                        Padding="12,8" Height="35" Margin="10,0,0,0"
                                        Background="#0ea5e9" Foreground="White"
                                        FontWeight="Bold" CornerRadius="6"/>
 
-								<TextBox Text="{Binding FirmwareFilePath}"
+								<TextBox x:Name="FirmwarePathBox"
                                         IsReadOnly="True"
                                         Padding="8" Height="35"
                                         Background="#f9fafb"
@@ -65,20 +52,16 @@
 					</StackPanel>
 				</StackPanel>
 			</Border>
-
-			<!-- СТАТУС -->
 			<Border Background="#fef3c7" CornerRadius="6" Padding="12"
                     BorderBrush="#fcd34d" BorderThickness="1">
-				<TextBlock Text="{Binding StatusText}"
+				<TextBlock x:Name="StatusTextBlock"
+                          Text="✅ Готово"
                           FontSize="12" FontWeight="Bold"
                           Foreground="#92400e" TextWrapping="Wrap"/>
 			</Border>
-
-			<!-- ЛОГИ -->
 			<StackPanel Spacing="8">
 				<DockPanel>
 					<Button DockPanel.Dock="Right" Content="🗑️ Очистить"
-                           Command="{Binding ClearLogsCommand}"
                            Padding="8,4" FontSize="11"
                            Background="#ef4444" Foreground="White" CornerRadius="4"/>
 
@@ -86,25 +69,20 @@
                               FontSize="12" FontWeight="Bold"/>
 				</DockPanel>
 
-				<TextBox IsReadOnly="True"
-                        Text="{Binding LogsText}"
-                        Background="White"
-                        Foreground="#1a1a1a"
-                        FontFamily="Courier New"
-                        FontSize="11"
-                        Padding="12"
-                        Height="350"
-                        VerticalScrollBarVisibility="Auto"
-                        TextWrapping="Wrap"
-                        BorderThickness="1"
-                        BorderBrush="#d1d5db"
-                        CornerRadius="6"/>
+				<Border BorderThickness="1" BorderBrush="#d1d5db"
+                        CornerRadius="6" Background="White" Height="250">
+					<ScrollViewer VerticalScrollBarVisibility="Auto">
+						<TextBlock x:Name="LogsTextBlock"
+                                  Text=""
+                                  Foreground="#1a1a1a"
+                                  FontFamily="Courier New"
+                                  FontSize="11"
+                                  Padding="12"
+                                  TextWrapping="Wrap"/>
+					</ScrollViewer>
+				</Border>
 			</StackPanel>
-
-			<!-- КНОПКА СТАРТ -->
 			<Button Content="▶️ НАЧАТЬ ОБНОВЛЕНИЕ"
-                   Command="{Binding StartUpdateCommand}"
-                   IsEnabled="{Binding !IsUpdating}"
                    Padding="20,15"
                    Height="50"
                    FontSize="16"
@@ -114,8 +92,6 @@
                    CornerRadius="8"
                    HorizontalAlignment="Center"
                    Width="500"/>
-
-		</StackPanel>
+		</StackPanel>	
 	</ScrollViewer>
-
 </Window>
